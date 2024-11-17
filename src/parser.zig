@@ -10,27 +10,36 @@ const Allocator = std.mem.Allocator;
 
 pub const Parser = struct {
     lexer: *Lexer,
-
+    errors: std.ArrayList([]u8),
     curToken: Token,
     peekToken: Token,
+    allocator: Allocator,
 
-    pub fn init(lexer: *Lexer) Parser {
+    pub fn init(allocator: Allocator, lexer: *Lexer) Parser {
         const cur_token = lexer.nextToken();
         const peek_token = lexer.nextToken();
 
         const p = Parser{
             .lexer = lexer,
+            .errors = std.ArrayList([]u8).init(allocator),
             .curToken = cur_token,
             .peekToken = peek_token,
+            .allocator = allocator,
         };
 
         return p;
     }
 
-    pub fn parseProgram(self: *Parser, allocator: Allocator) !ast.Program {
-        var stmts = std.ArrayList(ast.Statement).init(allocator);
-        defer stmts.deinit();
-        errdefer stmts.deinit();
+    pub fn deinit(self: *Parser) void {
+        for (self.errors.items) |item| {
+            self.allocator.free(item);
+        }
+
+        self.errors.deinit();
+    }
+
+    pub fn parseProgram(self: *Parser) !ast.Program {
+        var stmts = std.ArrayList(ast.Statement).init(self.allocator);
 
         while (self.curToken.tokenType != Token.TokenType.EOF) {
             const stmt: ?ast.Statement = self.parseStatement() catch null;
@@ -44,8 +53,15 @@ pub const Parser = struct {
         self.nextToken();
 
         return ast.Program{
-            .statements = try stmts.toOwnedSlice(),
+            .statements = stmts,
         };
+    }
+
+    fn peekError(self: *Parser, tokenType: Token.TokenType) void {
+        const str: ?[]u8 = std.fmt.allocPrint(self.allocator, "expected {s} found {s}", .{ @tagName(self.curToken.tokenType), @tagName(tokenType) }) catch return;
+        if (str) |strn| {
+            self.errors.append(strn) catch {};
+        }
     }
 
     fn parseStatement(self: *Parser) !ast.Statement {
@@ -56,18 +72,37 @@ pub const Parser = struct {
                     .letStatement = ltstmt,
                 };
             },
-
+            .RETURN => {
+                const rstmt = try self.parseReturnStatement();
+                return ast.Statement{
+                    .returnStatement = rstmt,
+                };
+            },
             else => {
                 return error.NotSupported;
             },
         }
     }
 
+    fn parseReturnStatement(self: *Parser) !ast.ReturnStatement {
+        const token = self.curToken;
+
+        const rtstmt = ast.ReturnStatement{
+            .token = token,
+            .expression = null,
+        };
+
+        while (self.curToken.tokenType != Token.TokenType.SEMICOLON) {
+            self.nextToken();
+        }
+
+        return rtstmt;
+    }
+
     fn parseLetStatement(self: *Parser) !ast.LetStatement {
         const token = self.curToken;
 
         try self.expectPeek(Token.TokenType.IDENT);
-        self.nextToken();
 
         // std.debug.print("{any}", self.curToken);
         const name = ast.Identifier{
@@ -92,8 +127,11 @@ pub const Parser = struct {
 
     fn expectPeek(self: *Parser, expected: Token.TokenType) !void {
         if (self.peekToken.tokenType != expected) {
+            self.peekError(expected);
             return error.UnexpectedPeek;
         }
+
+        self.nextToken();
     }
 
     fn nextToken(self: *Parser) void {
@@ -109,24 +147,27 @@ test "let statement parses correctly" {
         \\let foobar = 8383838;
     ;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const check = gpa.deinit();
-        assert(check == .ok, "leaked memory") catch @panic("leaked memory");
-    }
-
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var lex = Lexer.init(input);
-    var psr = Parser.init(&lex);
+    var psr = Parser.init(allocator, &lex);
 
-    const program: ?ast.Program = psr.parseProgram(allocator) catch null;
+    if (psr.errors.items.len > 0) {
+        for (psr.errors.items) |item| {
+            std.log.err("{s}", .{item});
+        }
+
+        return error.ParserErrorsFound;
+    }
+
+    defer psr.deinit();
+
+    const program: ?ast.Program = psr.parseProgram() catch null;
 
     if (program) |prog| {
-        try assert(prog.statements.len == 3, "program.Statements does not contain 3 statements");
+        try assert(prog.statements.items.len == 3, "program.Statements does not contain 3 statements");
 
-        defer allocator.free(prog.statements[0..prog.statements.len]);
-        errdefer allocator.free(prog.statements[0..prog.statements.len]);
+        defer prog.statements.deinit();
 
         const Test = struct {
             expectedIdentifier: []const u8,
@@ -139,11 +180,42 @@ test "let statement parses correctly" {
         };
 
         for (tests, 0..) |tst, i| {
-            const stmt = prog.statements[i];
+            const stmt = prog.statements.items[i];
             try testLetStatement(tst.expectedIdentifier, stmt);
         }
     } else {
-        try assert(false, "ParseProgram() returned null");
+        return error.NullProgram;
+    }
+}
+
+test "test return statement found" {
+    const a = std.testing.allocator;
+    const input =
+        \\return 5;
+        \\return 10;
+        \\return 993322;
+    ;
+    var lexer = Lexer.init(input);
+    var parser = Parser.init(a, &lexer);
+    const program: ?ast.Program = parser.parseProgram() catch null;
+
+    if (program) |prog| {
+        defer prog.statements.deinit();
+
+        try std.testing.expectEqual(prog.statements.items.len, 3);
+        for (prog.statements.items) |stmt| {
+            switch (stmt) {
+                .returnStatement => |stm| {
+                    try std.testing.expectEqual(@TypeOf(stm), ast.ReturnStatement);
+                    try std.testing.expectEqualStrings(stm.tokenLiteral(), "return");
+                },
+                else => {
+                    return error.NotReturnStatement;
+                },
+            }
+        }
+    } else {
+        return error.NullProgram;
     }
 }
 
@@ -152,6 +224,10 @@ fn testLetStatement(name: []const u8, s: ast.Statement) !void {
         .letStatement => {
             try std.testing.expectEqual(@TypeOf(s.letStatement), ast.LetStatement);
             try std.testing.expectEqualStrings(s.letStatement.name.tokenLiteral(), name);
+        },
+
+        else => {
+            return error.NotLetStatement;
         },
     }
 }

@@ -3,6 +3,19 @@ const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 const Token = @import("lexer.zig").Token;
 
+pub const ReturnStatement = struct {
+    token: Token,
+    expression: ?Expression,
+
+    pub fn statementNode(self: ReturnStatement) void {
+        _ = self;
+    }
+
+    pub fn tokenLiteral(self: ReturnStatement) []const u8 {
+        return self.token.literal;
+    }
+};
+
 pub const LetStatement = struct {
     token: Token,
     name: Identifier,
@@ -31,7 +44,7 @@ pub const Identifier = struct {
 };
 
 pub const Program = struct {
-    statements: []Statement,
+    statements: ArrayList(Statement),
 
     pub fn tokenLiteral(self: *Program) []const u8 {
         if (self.statements.len > 0) {
@@ -54,6 +67,7 @@ pub const Node = union(enum) {
 };
 
 pub const Statement = union(enum) {
+    returnStatement: ReturnStatement,
     letStatement: LetStatement,
 
     pub fn tokenLiteral(self: *Node) []const u8 {
